@@ -1,18 +1,18 @@
 """Main module."""
 
-from typing import Optional, Generator, Tuple, List, Sequence, Dict, Any
+from typing import Optional, Generator, Tuple, List, Sequence, Dict, Any, Union
 
 from anndata import AnnData
 from pandas import DataFrame
 
 import boto3 as bt
+from botocore.exceptions import ClientError
 import os
 import pandas as pd
 import scanpy as sc
 import tempfile
 import time
 import uuid
-
 
 class MASTCollectionError(Exception):
     def __init__(
@@ -47,7 +47,10 @@ class BatchMAST():
         lfc: float,
         covs: str = '',
         bys: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
-        min_perc: Optional[float] = None,
+        min_perc: Optional[Union[float, Dict[str, float]]] = None,
+        on_total: Optional[bool] = False,
+        min_cells_limit: Optional[int] = 3,
+        jobs: int = 1,
     ) -> Generator[
         Tuple[
             Dict[str, DataFrame],
@@ -61,13 +64,27 @@ class BatchMAST():
         if bys is None:
             if min_perc is not None:
                 adata = adata.copy()
-                sc.pp.filter_genes(adata, min_cells=adata.shape[0] * min_perc)
+                if on_total:
+                    total_cells = adata.shape[0]
+                else:
+                    total_cells = adata.obs[group].value_counts().min()
+                min_cells = max(total_cells * min_perc, min_cells_limit)
+                print(
+                    f'Filtering genes detected in fewer than {min_cells} cells'
+                )
+                sc.pp.filter_genes(adata, min_cells=min_cells)
+            enough_genes = adata.shape[1] > 0
             job_collection = {}
-            job_collection = self._mast(
-                job_collection, adata, covs, group, keys,
-            )
+            if enough_genes:
+                job_collection = self._mast(
+                    job_collection, adata, covs, group, keys, jobs=jobs,
+                )
+            else:
+                print('Not enough genes, computation skipped')
             try:
                 de, top = self.mast_prep_output(job_collection, lfc, fdr)
+            except ClientError as e:
+                raise MASTCollectionError(e, job_collection) from e
             except Exception as e:
                 raise MASTCollectionError(e.message, job_collection) from e
             yield de, top, None
@@ -77,18 +94,36 @@ class BatchMAST():
                 for b in groups:
                     adata_b = adata[adata.obs[by] == b].copy()
                     if min_perc is not None:
-                        sc.pp.filter_genes(
-                            adata_b, min_cells=adata_b.shape[0] * min_perc,
+                        if on_total:
+                            total_cells = adata_b.shape[0]
+                        else:
+                            total_cells = adata_b.obs[group].value_counts(
+                            ).min()
+                        min_cells = max(
+                            total_cells * min_perc[b], min_cells_limit
                         )
-                    enough_groups = adata_b.obs[group].nunique() > 1
-                    min_cells = adata_b.obs[group].value_counts().min()
-                    if enough_groups and min_cells >= 3:
+                        print(
+                            'Filtering genes detected in fewer '
+                            f'than {min_cells} cells'
+                        )
+                        sc.pp.filter_genes(
+                            adata_b, min_cells=min_cells,
+                        )
+                    enough_groups = (
+                        adata_b.obs[group].value_counts() >= 3
+                    ).sum() > 1
+                    enough_genes = adata_b.shape[1] > 0
+                    if enough_groups and enough_genes:
                         job_collection = self._mast(
                             job_collection, adata_b, covs, group,
-                            keys, by=by, b=b,
+                            keys, by=by, b=b, jobs=jobs,
                         )
+                    else:
+                        print(f'Computation for {b} skipped')
                 try:
                     de, top = self.mast_prep_output(job_collection, lfc, fdr)
+                except ClientError as e:
+                    raise MASTCollectionError(e, job_collection) from e
                 except Exception as e:
                     raise MASTCollectionError(e.message, job_collection) from e
                 yield de, top, by
@@ -102,12 +137,13 @@ class BatchMAST():
         keys: Sequence[str],
         by: Optional[str] = None,
         b: Optional[str] = None,
+        jobs: int = 1,
     ) -> Dict[str, Dict[str, str]]:
         if by is None:
             b = 'Sheet0'
         new_covs = BatchMAST._clean_covs(adata, covs, group, by=by)
         remote_dir, job_id, job_name, content = self.mast_compute(
-            adata, keys, group=group, covs=new_covs, block=False,
+            adata, keys, group=group, covs=new_covs, block=False, jobs=jobs,
         )
         job_collection[job_id] = {'group': b, 'remote_dir': remote_dir}
         return job_collection
@@ -143,14 +179,16 @@ class BatchMAST():
         top = {}
         for b in de.keys():
             cols = [
-                c.split('_')[0]
+                '_'.join(c.split('_')[:-1])
                 for c in de[b].columns[de[b].columns.str.endswith('_coef')]
             ]
             top[b] = {}
             for c in cols:
                 top[b][c] = de[b][
                     (de[b][f'{c}_fdr'] < fdr) & (de[b][f'{c}_coef'] > lfc)
-                ].sort_values(f'{c}_fdr', ascending=True).index.tolist()
+                ].sort_values([
+                    f'{c}_fdr', f'{c}_coef'
+                ], ascending=[True, False]).index.tolist()
         return top
 
     @staticmethod
@@ -175,6 +213,7 @@ class BatchMAST():
         group: str,
         covs: str = '',
         ready: Optional[Sequence[str]] = None,
+        jobs: int = 1,
     ) -> str:
         s3 = bt.resource('s3')
         if ready is None:
@@ -186,14 +225,18 @@ class BatchMAST():
                 adata.X = adata.layers[self.layer]
                 sc.pp.normalize_total(adata, target_sum=1e6)
                 sc.pp.log1p(adata, base=2)
-                adata.to_df().reset_index().to_feather(local_mat)
+                adata.to_df().reset_index().to_feather(
+                    local_mat, compression='uncompressed',
+                )
                 remote_mat = os.path.join(remote_dir, 'mat.fth')
+                print(f'Uploading matrix ({adata.shape}) to s3...')
                 s3.meta.client.upload_file(local_mat, self.bucket, remote_mat)
 
             if 'cdat' not in ready:
                 local_cdat = os.path.join(td, 'cdat.csv')
                 adata.obs[keys].to_csv(local_cdat)
                 remote_cdat = os.path.join(remote_dir, 'cdat.csv')
+                print('Uploading metadata to s3...')
                 s3.meta.client.upload_file(
                     local_cdat, self.bucket, remote_cdat)
 
@@ -201,12 +244,13 @@ class BatchMAST():
             manifest = '\n'.join([
                 f'WORKSPACE={remote}', 'BATCH_INDEX_OFFSET=0', 'CDAT=cdat.csv',
                 'MAT=mat.fth', f'GROUP={group}', 'OUT_NAME=out.csv',
-                f'MODEL=\'~group+n_genes{covs}\'',
+                f'MODEL=\'~group+n_genes{covs}\'', f'JOBS={jobs}',
             ])
             local_manifest = os.path.join(td, 'manifest.txt')
             with open(local_manifest, 'w') as m:
                 m.write(manifest + '\n')
             remote_manifest = os.path.join(remote_dir, 'manifest.txt')
+            print('Uploading manifest to s3...')
             s3.meta.client.upload_file(
                 local_manifest, self.bucket, remote_manifest,
             )
@@ -247,6 +291,7 @@ class BatchMAST():
         covs: str = '',
         block: bool = False,
         remote_dir: Optional[str] = None,
+        jobs: int = 1,
     ) -> Tuple[str, str, str, Optional[DataFrame]]:
         content = None
         if remote_dir is None:
@@ -255,7 +300,7 @@ class BatchMAST():
         else:
             ready = ['mat', 'cdat']
         manifest = self._mast_prep(
-            adata, remote_dir, keys, group, covs=covs, ready=ready,
+            adata, remote_dir, keys, group, covs=covs, ready=ready, jobs=jobs,
         )
         job_name = f'mast-{"".join(filter(str.isalnum, group))}-{"".join(filter(str.isalnum, covs))}'
         job_id = self._mast_submit(
