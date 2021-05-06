@@ -372,16 +372,23 @@ class BatchMAST():
         de: Dict[str, DataFrame],
         fname: str,
         top: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        top_prefix: str = None,
+        only_top: bool = False,
     ):
-        writer = pd.ExcelWriter(
-            f'{fname}.xlsx', engine='xlsxwriter'
-        )
-        for s in de.keys():
-            de[s].to_excel(writer, sheet_name=str(s))
-        writer.save()
-        if top is not None:
+        if not only_top:
             writer = pd.ExcelWriter(
-                f'{fname}.top.xlsx', engine='xlsxwriter'
+                f'{fname}.xlsx', engine='xlsxwriter'
+            )
+            for s in de.keys():
+                de[s].to_excel(writer, sheet_name=str(s))
+            writer.save()
+        if top is not None:
+            if top_prefix is None:
+                top_prefix = ''
+            else:
+                top_prefix = f'{top_prefix}.'
+            writer = pd.ExcelWriter(
+                f'{fname}.{top_prefix}top.xlsx', engine='xlsxwriter'
             )
             for s in top.keys():
                 pd.DataFrame.from_dict(
