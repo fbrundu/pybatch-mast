@@ -201,6 +201,9 @@ class BatchMAST():
         covs_s = covs.split('+')[1:]
         new_covs = ''
         for c in covs_s:
+            # Including only covariates with more than 1 level
+            # Otherwise, MAST will stop execution with error:
+            # contrasts can be applied only to factors with 2 or more levels
             if c not in (group, by) and adata.obs[c].nunique() > 1:
                 new_covs += f'+{c}'
         return new_covs
